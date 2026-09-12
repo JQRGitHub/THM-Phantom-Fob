@@ -1,0 +1,484 @@
+# CAN CTF Writeup: Reverse Engineering a Rolling-Code Key Fob
+
+## Overview
+
+This challenge presented a simulated vehicle instrument cluster through a web application. The dashboard displayed live vehicle state including:
+
+* Door lock state
+* Immobiliser state
+* Horn state
+* Vehicle speed
+* Turn signals
+* CAN frames per second
+* Number of observed CAN IDs
+* A flag field released after satisfying the challenge condition
+
+The supplied virtual key fob contained controls for:
+
+* LOCK
+* HORN
+* IMMOB_ARM
+* IMMOB_DISARM
+
+Notably, the interface explicitly stated:
+
+> Key fob — the buttons you have (no unlock)
+
+The goal was therefore to determine how key-fob commands were represented on the CAN bus and ultimately construct a valid UNLOCK command.
+
+
+## Initial Web Reconnaissance
+
+The application exposed two obvious HTTP endpoints.
+
+The dashboard received vehicle state from:
+
+GET /events
+
+using Server-Sent Events.
+
+The virtual key-fob buttons submitted:
+
+POST /press
+Content-Type: application/json
+
+with bodies such as:
+
+{"button":"LOCK"}
+
+Attempting to submit an obvious missing command:
+
+{"button":"UNLOCK"}
+
+returned:
+
+{"msg":"no such control","ok":false}
+
+This established that UNLOCK was not simply a hidden web control.
+
+The dashboard HTML also contained several useful clues:
+
+Instrument Cluster — live CAN
+IDs seen: 12
+Flag released on the bus
+
+
+This strongly suggested that the intended solution involved interacting directly with CAN rather than bypassing the web interface.
+
+
+## Discovering socketcand
+
+A TCP port scan revealed:
+
+22/tcp     SSH
+8080/tcp   Werkzeug web application
+29536/tcp  unknown
+
+Connections to TCP port 29536 returned:
+
+< hi >
+
+This was identified as the greeting used by **socketcand**, which exposes Linux SocketCAN interfaces over TCP.
+
+Opening the virtual CAN interface and switching to raw mode:
+
+< open vcan0 >
+< rawmode >
+
+returned:
+
+< ok >
+< ok >
+
+Live CAN traffic then became visible:
+
+< frame 429 1789173655.554768 010000a500000000 >
+
+This was the first major breakthrough.
+
+## Identifying the Vehicle-State Frame
+
+One frame appeared periodically with a notably simple payload:
+
+429  01 00 00 a5 00 00 00 00
+
+By pressing legitimate controls and observing this ID, the following relationship emerged:
+
+01 00 00 a5 00 00 00 00
+│  │  │
+│  │  └─ Horn
+│  └──── Immobiliser
+└─────── Door lock
+
+Examples included:
+
+01 00 00 a5 00 00 00 00   LOCKED / DISARMED / HORN OFF
+01 01 00 a5 00 00 00 00   LOCKED / ARMED / HORN OFF
+01 00 01 a5 00 00 00 00   LOCKED / DISARMED / HORN ON
+
+The obvious candidate for the unlocked state was therefore:
+
+00 00 00 a5 00 00 00 00
+
+Injecting that state frame caused the instrument cluster to briefly display:
+
+UNLOCKED
+
+Repeated transmission could even keep the dashboard showing an unlocked condition.
+However, the challenge did **not** complete.
+This was an important distinction: CAN ID 429 represented **vehicle status**, not the actual key-fob command that caused the vehicle state machine to transition.
+
+## Finding the Key-Fob Command Frame
+
+A small capture script was written to correlate each `/press` request with CAN activity immediately surrounding the button press.
+
+One relatively quiet CAN ID appeared exactly once for every fob action:
+
+12A
+
+Representative captures were:
+
+LOCK
+12A  2c 3c 49 b0 ad dc 48 ef
+
+HORN
+12A  34 19 ea b0 f7 a0 48 ef
+
+IMMOB_ARM
+12A  3c 3e 89 b0 3f 1c 48 ef
+
+IMMOB_DISARM
+12A  40 f4 6e b0 57 95 48 ef
+
+Repeated captures revealed a clear structure.
+
+Byte 0 increased monotonically:
+
+2c
+2d
+2e
+2f
+30
+31
+...
+
+while byte 1 remained constant for a given command:
+
+LOCK          = 3c
+HORN          = 19
+IMMOB_ARM     = 3e
+IMMOB_DISARM  = f4
+
+The apparent packet structure became:
+
+
+Byte 0   Rolling counter
+Byte 1   Command opcode
+Byte 2   Changing value
+Byte 3   Constant b0
+Byte 4   Changing value
+Byte 5   Changing value
+Byte 6   Constant 48
+Byte 7   Constant ef
+
+
+## Testing Replay Protection
+
+A valid HORN frame was captured and then retransmitted exactly.
+
+The replay did not activate the horn.
+
+Changing only the visible counter to the next value also failed.
+
+This demonstrated that the receiver enforced freshness and that the additional changing fields participated in packet validation.
+
+An 8-bit counter rollover experiment was also performed. Even after advancing the visible counter through a complete wrap, an old captured frame remained invalid.
+
+This suggested that the visible counter represented only part of the receiver's freshness state.
+
+## Concurrency Experiment
+
+The next breakthrough came from issuing many legitimate /press requests at nearly the same instant.
+
+A burst of concurrent requests produced frames similar to:
+
+56 3e 65 b0 01 e8 48 ef
+57 3c 65 b0 00 e8 48 ef
+58 f4 65 b0 b9 e8 48 ef
+59 19 65 b0 df e8 48 ef
+5a f4 65 b0 bb e8 48 ef
+...
+
+Two observations were particularly important.
+
+During the entire burst:
+
+Byte 2 = 65
+Byte 5 = e8
+
+remained constant.
+
+Under normal conditions, both values changed over time.
+
+This strongly suggested that the two fields represented short-lived freshness material such as a timestamp-derived value or nonce.
+
+More importantly, byte 4 was no longer mysterious.
+
+Across every captured packet:
+
+Byte4 =
+    Byte0
+  + Byte1
+  + Byte2
+  + Byte5
+  + 0x20
+
+with the result truncated to eight bits.
+
+In other words:
+
+checksum = (counter + command + freshness1 + freshness2 + 0x20) & 0xff
+
+For example:
+
+56 3e 65 b0 01 e8 48 ef
+
+gives:
+
+0x56 + 0x3e + 0x65 + 0xe8 + 0x20
+= 0x201
+
+0x201 & 0xff
+= 0x01
+
+which exactly matches the packet's checksum byte.
+
+The concurrency experiment had effectively exposed the validation algorithm.
+
+## Forging a Valid Known Command
+
+Before attempting the missing command, the recovered packet format needed to be verified.
+
+A fresh legitimate frame was captured to obtain:
+
+current rolling counter
+freshness byte A
+freshness byte B
+
+A new frame was then constructed for the **next** counter value using the already known IMMOB_ARM opcode.
+
+The checksum was recalculated as:
+
+checksum = (
+    counter
+    + command
+    + freshness1
+    + freshness2
+    + 0x20
+) & 0xff
+
+The resulting forged packet had the form:
+
+[counter]
+[IMMOB_ARM]
+[freshness1]
+[b0]
+[checksum]
+[freshness2]
+[48]
+[ef]
+
+After injection, the vehicle changed from:
+
+
+IMMOBILISER: DISARMED
+
+to:
+
+IMMOBILISER: ARMED
+
+without using the legitimate ARM control.
+
+This confirmed that the protocol had been successfully reconstructed and that arbitrary valid fob commands could be generated as long as fresh state was used.
+
+## Locating the Missing UNLOCK Command
+
+At this stage, only a single unknown remained:
+
+UNLOCK opcode = ?
+
+The known command-byte values were:
+
+HORN          = 0x19
+LOCK          = 0x3c
+IMMOB_ARM     = 0x3e
+IMMOB_DISARM  = 0xf4
+
+Because the command field was a single byte, the remaining search space was small.
+
+For each candidate value, the test harness:
+
+1. Generated a legitimate command to obtain current freshness material.
+2. Captured the current rolling counter.
+3. Advanced to the expected next counter value.
+4. Inserted a candidate command byte.
+5. Recalculated the checksum.
+6. Injected the forged frame immediately.
+7. Watched CAN ID 429 for a transition to the unlocked state.
+8. Monitored the application's event stream for challenge completion.
+
+The relevant logic was essentially:
+
+for opcode in range(256):
+
+    fresh = capture_legitimate_frame()
+
+    counter = (fresh.counter + 1) & 0xff
+
+    checksum = (
+        counter
+        + opcode
+        + fresh.byte2
+        + fresh.byte5
+        + 0x20
+    ) & 0xff
+
+    forged = [
+        counter,
+        opcode,
+        fresh.byte2,
+        0xb0,
+        checksum,
+        fresh.byte5,
+        0x48,
+        0xef
+    ]
+
+    inject(forged)
+
+    if vehicle_unlocked():
+        print("UNLOCK command identified")
+        break
+
+One candidate eventually caused the genuine vehicle state machine to transition to:
+
+UNLOCKED
+
+and satisfied the challenge.
+
+The actual opcode and resulting flag are deliberately omitted.
+
+## Recovered Protocol Structure
+
+The reconstructed key-fob frame was:
+
+Byte 0   Rolling counter
+Byte 1   Command opcode
+Byte 2   Freshness value A
+Byte 3   0xb0
+Byte 4   8-bit additive checksum
+Byte 5   Freshness value B
+Byte 6   0x48
+Byte 7   0xef
+
+Checksum:
+
+B4 = (B0 + B1 + B2 + B5 + 0x20) mod 256
+
+Known command values:
+
+LOCK          0x3c
+HORN          0x19
+IMMOB_ARM     0x3e
+IMMOB_DISARM  0xf4
+UNLOCK        <REDACTED>
+
+## Lessons Learned
+
+Several elements of the challenge were useful hints rather than decoration.
+
+The phrase:
+
+> Key fob — the buttons you have (no unlock)
+
+suggested that UNLOCK existed at the protocol level even though the interface did not expose the corresponding control.
+
+Likewise:
+
+> Flag released on the bus
+
+was a strong clue that manipulating only the displayed vehicle state would not satisfy the challenge.
+
+The most important distinction was:
+
+429 = vehicle state/status
+12A = key-fob command
+
+Spoofing the former changed what the instrument cluster displayed. Forging the latter caused the actual simulated vehicle logic to perform the operation.
+
+The concurrency experiment proved particularly effective. By generating multiple legitimate commands during the same freshness interval, normally changing fields became constant, allowing the checksum relationship to become obvious.
+
+What initially resembled a more sophisticated rolling-code authentication system ultimately reduced to:
+
+freshness
++ rolling counter
++ command opcode
++ 8-bit additive checksum
+
+Once the structure was understood, constructing fresh valid packets became straightforward.
+
+## Solution Path
+
+The overall progression was:
+
+Web reconnaissance
+        ↓
+Discover socketcand
+        ↓
+Capture raw CAN traffic
+        ↓
+Identify vehicle-state ID
+        ↓
+Spoof unlocked status
+        ↓
+Realize status spoofing is insufficient
+        ↓
+Identify fob-command ID
+        ↓
+Decode rolling counter and command byte
+        ↓
+Demonstrate replay protection
+        ↓
+Use concurrent legitimate requests
+        ↓
+Expose freshness behavior
+        ↓
+Recover checksum algorithm
+        ↓
+Forge a known valid command
+        ↓
+Search the remaining command field
+        ↓
+Trigger genuine UNLOCK behavior
+        ↓
+Challenge complete
+
+## Conclusion
+
+This was an excellent challenge combining several layers of analysis:
+
+* Web reconnaissance
+* Service identification
+* socketcand / SocketCAN
+* CAN traffic analysis
+* State-versus-command differentiation
+* Rolling-code behavior
+* Replay testing
+* Concurrency testing
+* Protocol reverse engineering
+* Checksum recovery
+* CAN-frame forgery
+
+The most satisfying part was that the challenge could not be solved simply by changing the visible vehicle state.
+It required understanding the actual command path and producing a frame that the simulated receiver accepted as a legitimate fresh key-fob command.
+
