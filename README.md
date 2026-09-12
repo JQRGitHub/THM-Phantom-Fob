@@ -33,9 +33,13 @@ The scripts assume the CAN interface is vcan0 unless overridden.
 ## Example Usage
 
 Watch all CAN traffic: python3 watch\_can.py <TARGET\_IP>
+
 Watch only selected IDs: python3 watch\_can.py <TARGET\_IP> --ids 12A,429
+
 Correlate legitimate fob presses with CAN frames: python3 capture\_fob.py <TARGET\_IP>
+
 Run the concurrency experiment after identifying the fob CAN ID: python3 race.py <TARGET\_IP> --fob-id 12A
+
 Demonstrate forging a known valid immobiliser-arm command: python3 forge\_demo.py <TARGET\_IP> --fob-id 12A --state-id 429
 
 
