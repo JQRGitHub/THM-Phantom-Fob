@@ -1,4 +1,4 @@
-# Phantom Fob — Companion Code
+# Phantom Fob
 
 This repository accompanies the **Phantom Fob** CAN CTF writeup.
 
